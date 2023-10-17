@@ -1,6 +1,18 @@
 import json
+import os
 import boto3
 import re
+import json
+import datetime
+import time
+import os
+import dateutil.parser
+from datetime import datetime
+import logging
+from utils import *
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
 
 # Initialize SQS client
 sqs = boto3.client('sqs')
@@ -8,76 +20,17 @@ sqs = boto3.client('sqs')
 # SQS Queue URL
 queue_url = 'https://sqs.us-east-1.amazonaws.com/466579977483/newLex'
 
-def handle_greeting_intent():
+
+def delegate(session_attributes, slots):
     return {
-        "dialogAction": {
-            "type": "Close",
-            "fulfillmentState": "Fulfilled",
-            "message": {
-                "contentType": "PlainText",
-                "content": "Hi there, how can I help?"
-            }
+        'sessionAttributes': session_attributes,
+        'dialogAction': {
+            'type': 'Delegate',
+            'slots': slots
         }
     }
 
-def handle_thank_you_intent():
-    return {
-        "dialogAction": {
-            "type": "Close",
-            "fulfillmentState": "Fulfilled",
-            "message": {
-                "contentType": "PlainText",
-                "content": "You're welcome! If you have any more questions, feel free to ask."
-            }
-        }
-    }
-
-def validate_dining_request(slots):
-    # Validate Location
-    location = slots.get('Location')
-    if not location:
-        return "Please provide a valid location."
-
-    # Validate Cuisine
-    cuisine = slots.get('Cuisine')
-    if not cuisine:
-        return "Please specify your preferred cuisine."
-
-    # Validate DiningTime
-    dining_time = slots.get('DiningTime')
-    if not dining_time:
-        return "Please provide a dining time."
-
-    # Validate NumberOfPeople
-    num_people = slots.get('NumPeople')
-    if not num_people or not num_people.isdigit():
-        return "Please specify the number of people for the reservation. "
-
-    # Validate Email (You can add a more sophisticated email validation)
-    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-    email = slots.get('Email')
-    if not email or not "@" in email or not re.match(pattern, email):
-        return "Please provide a valid email address."
-
-    return None  # No validation errors
-
-def handle_dining_request(event):
-    slots = event['currentIntent']['slots']
-
-    # Validate the dining request
-    validation_error = validate_dining_request(slots)
-    if validation_error:
-        return {
-            "dialogAction": {
-                "type": "Close",
-                "fulfillmentState": "Failed",
-                "message": {
-                    "contentType": "PlainText",
-                    "content": validation_error
-                }
-            }
-        }
-
+def send_sqs_message(slots):
     # Prepare the message
     message_attributes = {
         'Location': {'StringValue': slots['Location'], 'DataType': 'String'},
@@ -94,36 +47,126 @@ def handle_dining_request(event):
         MessageBody=json.dumps(message_attributes)
     )
 
-    # Respond to the user
+def confirm_intent(intent_name, slots, message):
     return {
+        'dialogAction': {
+            'type': 'ConfirmIntent',
+            'intentName': intent_name,
+            'slots': slots,
+            'message': {
+                'contentType': 'PlainText',
+                'content': message
+            }
+        }
+    }
+
+# Main Handlers
+def handle_greeting_intent(session_attributes):
+    return {
+        "sessionAttributes": session_attributes,
         "dialogAction": {
             "type": "Close",
             "fulfillmentState": "Fulfilled",
             "message": {
                 "contentType": "PlainText",
-                "content": "We have received your request and will notify you via email with a list of restaurant suggestions."
+                "content": "Hi there, how can I help?"
             }
         }
     }
 
-def lambda_handler(event, context):
-    intent_name = event['currentIntent']['name']
 
-    if intent_name == "GreetingIntent":
-        return handle_greeting_intent()
-    elif intent_name == "ThankYouIntent":
-        return handle_thank_you_intent()
-    elif intent_name == "Iwanttohavesomefood":
-        return handle_dining_request(event)
-    else:
+def handle_thank_you_intent(session_attributes):
+    return {
+        "sessionAttributes": session_attributes,
+        "dialogAction": {
+            "type": "Close",
+            "fulfillmentState": "Fulfilled",
+            "message": {
+                "contentType": "PlainText",
+                "content": "You're welcome! If you have any more questions, feel free to ask."
+            }
+        }
+    }
+
+def dispatch(intent_request):
+    logger.debug('dispatch userId={}, intentName={}'.format(intent_request['userId'], intent_request['currentIntent']['name']))
+    intent_name = intent_request['currentIntent']['name']
+    if intent_name == 'Iwanttohavesomefood':
+        return find_food(intent_request)
+
+    raise Exception('Intent with name ' + intent_name + ' not supported')
+
+def lambda_handler(event, context):
+    # By default, treat the user request as coming from the America/New_York time zone.
+    os.environ['TZ'] = 'America/New_York'
+    time.tzset()
+    logger.debug('event.bot.name={}'.format(event['bot']['name']))
+
+        # Check if the user's input matches a greeting phrase
+    if event['inputTranscript'] in ['hello', 'hi', 'hey']:
         return {
-            "dialogAction": {
-                "type": "Close",
-                "fulfillmentState": "Failed",
-                "message": {
-                    "contentType": "PlainText",
-                    "content": "Sorry, I didn't understand that request."
+            'sessionAttributes': event['sessionAttributes'],
+            'dialogAction': {
+                'type': 'ElicitIntent',
+                'message': {
+                    'contentType': 'PlainText',
+                    'content': 'Hello! I noticed you might be hungry. How can I assist you with food?'
                 }
             }
         }
+        # Add other logic for the intent here
 
+    return dispatch(event)
+# Lambda Handler
+
+
+
+def find_food(intent_request):
+    slots = try_ex(lambda: intent_request['currentIntent']['slots'])
+    location = try_ex(lambda: slots['Location'])
+    cuisine = try_ex(lambda: slots['Cuisine'])
+    dining_time = try_ex(lambda: slots['DiningTime'])
+    number_of_people = safe_int(try_ex(lambda: slots['NumPeople']))
+    email = try_ex(lambda: slots['Email'])
+
+    session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {}
+    # Load food history and track the current findings.
+    reservation = json.dumps({
+        'Location': location,
+        'NumPeople': number_of_people,
+        'Cuisine': cuisine,
+        'DiningTime': dining_time,
+        'Email': email
+    })
+    session_attributes['currentReservation'] = reservation
+    if intent_request['invocationSource'] == 'DialogCodeHook':
+        # Validate any slots which have been specified.  If any are invalid, re-elicit for their value
+        validation_result = validate_dining_request(slots)
+        if not validation_result['isValid']:
+            slots[validation_result['violatedSlot']] = None
+
+            return elicit_slot(
+                session_attributes,
+                intent_request['currentIntent']['name'],
+                slots,
+                validation_result['violatedSlot'],
+                validation_result['message']
+            )
+
+        session_attributes['currentReservation'] = reservation
+        return delegate(session_attributes, intent_request['currentIntent']['slots'])
+
+    logger.debug('book reservation under={}'.format(reservation))
+    send_sqs_message(slots)
+
+    session_attributes['lastConfirmedReservation'] = reservation
+
+    return close(
+        session_attributes,
+        'Fulfilled',
+        {
+            'contentType': 'PlainText',
+            'content': 'Your reservation has been successfully made,'
+                       ' and an email containing all the details has been sent to you.'
+        }
+    )

@@ -1,118 +1,173 @@
 import json
-import pandas as pd
-import requests
-from datetime import datetime
-from decimal import Decimal
 import boto3
+from boto3.dynamodb.conditions import Key
+import random
+import requests
+
+# Initialize clients
+ses_client = boto3.client('ses', region_name='us-east-1')
+sqs = boto3.client('sqs', region_name='us-east-1')  # Specify the region
+
+# Specify the SQS queue URL
+queue_url = 'https://sqs.us-east-1.amazonaws.com/466579977483/newLex'
 
 
-def get_yelp_data(cuisines, location, search_limit=50):
-    api_key = 'your_api_key_here'
-    headers = {'Authorization': 'Bearer {}'.format(api_key)}
-    url = 'https://api.yelp.com/v3/businesses/search'
+def send_email(destination, subject, body):
+    try:
+        ses_client.send_email(
+            Destination=destination,
+            Message={
+                'Body': {'Text': {'Data': body}},
+                'Subject': {'Data': subject}
+            },
+            Source='sr6890@nyu.edu'
+        )
+        print("Email sent successfully")
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
 
-    all_responses = [[] for _ in cuisines]
 
-    for idx, cuisine in enumerate(cuisines):
-        print(f'Gathering Data for {cuisine}')
+def fetch_restaurant_details(restaurant_ids, table_name):
+    dynamodb = boto3.resource('dynamodb', region_name="us-east-1")
+    table = dynamodb.Table(table_name)
+    restaurant_details = []
+    for restaurant_id in restaurant_ids:
+        response = table.query(
+            KeyConditionExpression=Key('Business_ID').eq(restaurant_id)
+        )
+        items = response.get('Items', [])
+        if items:
+            restaurant_details.append(items[0])
+    return restaurant_details
 
-        for offset in range(0, 80 * search_limit, search_limit):
-            params = {
-                'location': location,
-                'term': f"{cuisine} Restaurants",
-                'limit': search_limit,
-                'offset': offset,
-                'categories': '(restaurants)',
-                'sort_by': 'distance'
+
+def perform_elasticsearch_search(input_cuisine):
+    es_endpoint = "https://search-restaurants-es-pta45ddtntzo5ysyfs7xp2prye.us-east-1.es.amazonaws.com"
+    es_index = "restaurants"
+    es_username = "dinebot-user"
+    es_password = "CCfall2023!"
+
+    search_query = {
+        "query": {
+            "bool": {
+                "must": [{"match": {"categories": input_cuisine}}],
+                "must_not": [],
+                "should": []
             }
+        },
+        "from": 0,
+        "size": 50,
+        "sort": [],
+        "aggs": {}
+    }
 
-            response = requests.get(url, headers=headers, params=params)
-            all_responses[idx].append(response)
+    search_url = f"{es_endpoint}/{es_index}/_search"
 
-    return all_responses
-
-
-def create_dataframe(all_responses, cuisines):
-    df_list = []
-
-    for idx, cuisine in enumerate(cuisines):
-        for response in all_responses[idx]:
-            if 'businesses' in response.json():
-                df_temp = pd.DataFrame.from_dict(response.json()['businesses'])
-                df_temp['cuisine'] = cuisine
-                df_list.append(df_temp)
-
-    df = pd.concat(df_list, ignore_index=True)
-    df.drop_duplicates(subset=['name'], keep='first', inplace=True)
-    return df
+    try:
+        response = requests.post(search_url, json=search_query, auth=(es_username, es_password))
+        response.raise_for_status()
+        data = response.json()
+        restaurant_hits = data.get('hits', {}).get('hits', [])
+        return restaurant_hits
+    except Exception as e:
+        print(f"Error making Elasticsearch request: {str(e)}")
+        return []
 
 
-def save_to_dynamodb(selected_rows):
-    dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-    table = dynamodb.Table('yelp-restaurants')
+def process_message(message_body):
+    input_cuisine = message_body.get("Cuisine", {}).get("StringValue", "")
+    email_address = message_body.get("Email", {}).get("StringValue", "")
+    dining_time = message_body.get("DiningTime", {}).get("StringValue", "")
+    num_people = message_body.get("NumberOfPeople", {}).get("StringValue", "")
 
-    for _, row in selected_rows.iterrows():
-        coordinates = row['coordinates']
-        coordinates = {key: Decimal(str(value)) for key, value in coordinates.items()}
+    restaurant_hits = perform_elasticsearch_search(input_cuisine)
 
-        item = {
-            'insertedAtTimestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'Business_ID': row['id'],
-            'Name': row['name'],
-            'Coordinates': coordinates,
-            'Review_Count': int(row['review_count']),
-            'Rating': Decimal(str(row['rating'])),
-            'Address': row['location']['address1'],
-            'Cuisine': row['cuisine'],
-            'Zip_Code': row['location'].get('zip_code', '')
+    if not restaurant_hits:
+        return None
+
+    restaurant_ids = [hit['_source']['business_id'] for hit in restaurant_hits]
+    random.shuffle(restaurant_ids)
+    restaurant_details = fetch_restaurant_details(restaurant_ids[:3], "yelp-restaurants")
+
+    return {
+        'input_cuisine': input_cuisine,
+        'email_address': email_address,
+        'dining_time': dining_time,
+        'num_people': num_people,
+        'restaurant_details': restaurant_details
+    }
+
+
+def lambda_handler(event, context):
+    print("Received event:")
+    print(json.dumps(event, indent=2))
+
+    try:
+        response = sqs.receive_message(
+            QueueUrl=queue_url,
+            AttributeNames=['All'],
+            MessageAttributeNames=['All'],
+            MaxNumberOfMessages=10,
+            VisibilityTimeout=30,
+            WaitTimeSeconds=0
+        )
+    except Exception as e:
+        print(f"Error receiving messages from SQS: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": "Error receiving messages from SQS"})
         }
+    finally:
+        # Check if there are any messages in the response and delete them
+        if 'Messages' in response:
+            for message in response['Messages']:
+                sqs.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=message['ReceiptHandle']
+                )
+    print(response)
 
-        table.put_item(Item=item)
+    if 'Messages' in response:
+        for message in response['Messages']:
+            try:
+                message_body = json.loads(message['Body'])
+                print(f"Received message: {message_body}")
 
+                result = process_message(message_body)
 
-def save_to_opensearch(data_array):
-    url = 'https://search-restaurants-es-pta45ddtntzo5ysyfs7xp2prye.us-east-1.es.amazonaws.com/restaurants/_doc/'
-    username = 'dinebot-user'
-    password = 'CCfall2023!'
-    headers = {'Content-Type': 'application/json'}
+                if result:
+                    input_cuisine = result['input_cuisine']
+                    email_address = result['email_address']
+                    dining_time = result['dining_time']
+                    num_people = result['num_people']
+                    restaurant_details = result['restaurant_details']
 
-    for idx, data in enumerate(data_array, start=1):
-        data_fixed = json.dumps({
-            'business_id': data['id'],
-            'categories': data['cuisine']
-        })
+                    email_subject = 'Restaurant Suggestions'
+                    email_body = f"Hello! Here are my {input_cuisine} restaurant suggestions for {num_people} people at {dining_time} in {location}:\n"
 
-        response = requests.put(url + str(idx), auth=(username, password), data=data_fixed, headers=headers)
-        if response.status_code == 200:
-            print('Data uploaded successfully.')
-        else:
-            print(f'Error: {response.status_code} - {response.text}')
+                    for i, restaurant in enumerate(restaurant_details, start=1):
+                        email_body += f"{i}. {restaurant['Name']}, located at {restaurant['Address']}\n"
 
+                    email_body += "Enjoy your meal!"
 
-def main():
-    cuisines = ['Indian', 'Chinese', 'Italian']
-    location = 'Manhattan'
+                    destination = {'ToAddresses': [email_address]}
+                    send_email(destination, email_subject, email_body)
 
-    all_responses = get_yelp_data(cuisines, location)
-    df = create_dataframe(all_responses, cuisines)
-
-    selected_rows = pd.concat([df[df['cuisine'] == cuisine].head(50) for cuisine in cuisines], ignore_index=True)
-    json_list = selected_rows[['id', 'cuisine']].to_dict('records')
-    json_string = json.dumps(json_list)
-
-    with open('selected_rows_es.json', 'w') as json_file:
-        json_file.write(json_string)
-
-    selected_rows.to_csv('selected_rows.csv')
-    selected_rows.to_json('selected_rows.json')
-
-    save_to_dynamodb(selected_rows)
-
-    with open('selected_rows_es.json', 'r') as file:
-        data_array = json.load(file)
-
-    save_to_opensearch(data_array)
+                    print("Sending email...")
+                    print(f"Subject: {email_subject}")
+                    print(f"Body: {email_body}")
 
 
-if __name__ == '__main__':
-    main()
+                else:
+                    print("No restaurant suggestions for this message")
+
+            except Exception as e:
+                print(f"Error processing message: {str(e)}")
+                continue
+    else:
+        print("No messages in the queue")
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('No messages to process')
+    }
